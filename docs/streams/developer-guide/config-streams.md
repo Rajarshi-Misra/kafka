@@ -1195,38 +1195,32 @@ Serde for the inner class of a windowed record. Must implement the `Serde` inter
 > 
 
 > 
-> You can also provide your own customized exception handler besides the library provided ones to meet your needs. When implementing a custom handler, prefer overriding `handleError(...)` and returning `DeserializationExceptionHandler.Response`. This lets the handler return both a handling decision and optional dead letter queue records. If you only override deprecated `handle(...)` methods, Kafka Streams cannot receive custom dead letter queue records from your handler.
+> You can also provide your own customized exception handler besides the library provided ones to meet your needs. For example, you can choose to forward corrupt records into a quarantine topic (think: a "dead letter queue") for further processing. To do this, use the Producer API to write a corrupted record directly to the quarantine topic. To be more concrete, you can create a separate `KafkaProducer` object outside the Streams client, and pass in this object as well as the dead letter queue topic name into the `Properties` map, which then can be retrieved from the `configure` function call. The drawback of this approach is that "manual" writes are side effects that are invisible to the Kafka Streams runtime library, so they do not benefit from the end-to-end processing guarantees of the Streams API:
 >     
->     
->     import java.util.List;
->     import java.util.Map;
->     import org.apache.kafka.clients.consumer.ConsumerRecord;
->     import org.apache.kafka.clients.producer.ProducerRecord;
->     import org.apache.kafka.streams.StreamsConfig;
->     import org.apache.kafka.streams.errors.DeserializationExceptionHandler;
->     import org.apache.kafka.streams.errors.ErrorHandlerContext;
 >     
 >     public class SendToDeadLetterQueueExceptionHandler implements DeserializationExceptionHandler {
+>         KafkaProducer<byte[], byte[]> dlqProducer;
 >         String dlqTopic;
 >     
 >         @Override
->         public Response handleError(final ErrorHandlerContext context,
->                                     final ConsumerRecord<byte[], byte[]> record,
->                                     final Exception exception) {
+>         public DeserializationHandlerResponse handle(final ErrorHandlerContext context,
+>                                                      final ConsumerRecord<byte[], byte[]> record,
+>                                                      final Exception exception) {
 >     
 >             log.warn("Exception caught during Deserialization, sending to the dead queue topic; " +
 >                 "taskId: {}, topic: {}, partition: {}, offset: {}",
 >                 context.taskId(), record.topic(), record.partition(), record.offset(),
 >                 exception);
 >     
->             final ProducerRecord<byte[], byte[]> dlqRecord =
->                 new ProducerRecord<>(dlqTopic, record.timestamp(), record.key(), record.value(), record.headers());
->             return Response.resume(List.of(dlqRecord));
+>             dlqProducer.send(new ProducerRecord<>(dlqTopic, record.timestamp(), record.key(), record.value(), record.headers())).get();
+>     
+>             return DeserializationHandlerResponse.CONTINUE;
 >         }
 >     
 >         @Override
 >         public void configure(final Map<String, ?> configs) {
->             dlqTopic = (String) configs.get(StreamsConfig.ERRORS_DEAD_LETTER_QUEUE_TOPIC_NAME_CONFIG);
+>             dlqProducer = .. // get a producer from the configs map
+>             dlqTopic = .. // get the topic name from the configs map
 >         }
 >     }
 
@@ -1234,28 +1228,35 @@ Serde for the inner class of a windowed record. Must implement the `Serde` inter
 
 > The production exception handler allows you to manage exceptions triggered when trying to interact with a broker such as attempting to produce a record that is too large. By default, Kafka provides and uses the [DefaultProductionExceptionHandler](/{version}/javadoc/org/apache/kafka/streams/errors/DefaultProductionExceptionHandler.html) that always fails when these exceptions occur.
 > 
-> An exception handler can return `FAIL`, `RESUME`, or `RETRY` depending on the record and the exception thrown. Returning `FAIL` will signal that Streams should shut down. `RESUME` will signal that Streams should ignore the issue and continue processing. For `RetriableException` the handler may return `RETRY` to tell the runtime to retry sending the failed record (**Note:** If `RETRY` is returned for a non-`RetriableException` it will be treated as `FAIL`.) If you want to provide an exception handler that always ignores records that are too large, you could implement something like the following:
+> An exception handler can return `FAIL`, `CONTINUE`, or `RETRY` depending on the record and the exception thrown. Returning `FAIL` will signal that Streams should shut down. `CONTINUE` will signal that Streams should ignore the issue and continue processing. For `RetriableException` the handler may return `RETRY` to tell the runtime to retry sending the failed record (**Note:** If `RETRY` is returned for a non-`RetriableException` it will be treated as `FAIL`.) If you want to provide an exception handler that always ignores records that are too large, you could implement something like the following:
 >     
 >     
->     import java.util.Map;
+>     import java.util.Properties;
+>     import org.apache.kafka.streams.StreamsConfig;
 >     import org.apache.kafka.common.errors.RecordTooLargeException;
->     import org.apache.kafka.clients.producer.ProducerRecord;
 >     import org.apache.kafka.streams.errors.ProductionExceptionHandler;
->     import org.apache.kafka.streams.errors.ErrorHandlerContext;
+>     import org.apache.kafka.streams.errors.ProductionExceptionHandler.ProductionExceptionHandlerResponse;
 >     
 >     public class IgnoreRecordTooLargeHandler implements ProductionExceptionHandler {
->         public void configure(Map<String, ?> config) {}
+>         public void configure(Map<String, Object> config) {}
 >     
->         public Response handleError(final ErrorHandlerContext context,
->                                     final ProducerRecord<byte[], byte[]> record,
->                                     final Exception exception) {
+>         public ProductionExceptionHandlerResponse handle(final ErrorHandlerContext context,
+>                                                          final ProducerRecord<byte[], byte[]> record,
+>                                                          final Exception exception) {
 >             if (exception instanceof RecordTooLargeException) {
->                 return Response.resume();
+>                 return ProductionExceptionHandlerResponse.CONTINUE;
 >             } else {
->                 return Response.fail();
+>                 return ProductionExceptionHandlerResponse.FAIL;
 >             }
 >         }
 >     }
+>     
+>     Properties settings = new Properties();
+>     
+>     // other various kafka streams settings, e.g. bootstrap servers, application id, etc
+>     
+>     settings.put(StreamsConfig.PRODUCTION_EXCEPTION_HANDLER_CLASS_CONFIG,
+>                  IgnoreRecordTooLargeHandler.class);
 
 ### default.timestamp.extractor
 
@@ -1454,44 +1455,32 @@ Serde for the inner class of a windowed record. Must implement the `Serde` inter
 > 
 
 > 
-> You can also provide your own customized exception handler besides the library provided ones to meet your needs. When implementing a custom handler, prefer overriding `handleError(...)` and returning `ProcessingExceptionHandler.Response`. This lets the handler return both a handling decision and optional dead letter queue records. If you only override deprecated `handle(...)` methods, Kafka Streams cannot receive custom dead letter queue records from your handler.
+> You can also provide your own customized exception handler besides the library provided ones to meet your needs. For example, you can choose to forward corrupt records into a quarantine topic (think: a "dead letter queue") for further processing. To do this, use the Producer API to write a corrupted record directly to the quarantine topic. To be more concrete, you can create a separate `KafkaProducer` object outside the Streams client, and pass in this object as well as the dead letter queue topic name into the `Properties` map, which then can be retrieved from the `configure` function call. The drawback of this approach is that "manual" writes are side effects that are invisible to the Kafka Streams runtime library, so they do not benefit from the end-to-end processing guarantees of the Streams API:
 >     
->     
->     import java.util.List;
->     import java.util.Map;
->     import org.apache.kafka.clients.producer.ProducerRecord;
->     import org.apache.kafka.streams.StreamsConfig;
->     import org.apache.kafka.streams.errors.ErrorHandlerContext;
->     import org.apache.kafka.streams.errors.ProcessingExceptionHandler;
->     import org.apache.kafka.streams.processor.api.Record;
 >     
 >     public class SendToDeadLetterQueueExceptionHandler implements ProcessingExceptionHandler {
+>         KafkaProducer<byte[], byte[]> dlqProducer;
 >         String dlqTopic;
 >     
 >         @Override
->         public Response handleError(final ErrorHandlerContext context,
->                                     final Record<?, ?> record,
->                                     final Exception exception) {
+>         public ProcessingHandlerResponse handle(final ErrorHandlerContext context,
+>                                                 final Record record,
+>                                                 final Exception exception) {
 >     
 >             log.warn("Exception caught during message processing, sending to the dead queue topic; " +
 >                 "processor node: {}, taskId: {}, source topic: {}, source partition: {}, source offset: {}",
 >                 context.processorNodeId(), context.taskId(), context.topic(), context.partition(), context.offset(),
 >                 exception);
 >     
->             final ProducerRecord<byte[], byte[]> dlqRecord = new ProducerRecord<>(
->                 dlqTopic,
->                 null,
->                 record.timestamp(),
->                 (byte[]) record.key(),
->                 (byte[]) record.value(),
->                 record.headers()
->             );
->             return Response.resume(List.of(dlqRecord));
+>             dlqProducer.send(new ProducerRecord<>(dlqTopic, null, record.timestamp(), (byte[]) record.key(), (byte[]) record.value(), record.headers()));
+>     
+>             return ProcessingHandlerResponse.CONTINUE;
 >         }
 >     
 >         @Override
 >         public void configure(final Map<String, ?> configs) {
->             dlqTopic = (String) configs.get(StreamsConfig.ERRORS_DEAD_LETTER_QUEUE_TOPIC_NAME_CONFIG);
+>             dlqProducer = .. // get a producer from the configs map
+>             dlqTopic = .. // get the topic name from the configs map
 >         }
 >     }
 
@@ -1949,3 +1938,4 @@ Admin
    * [Kafka Streams](/documentation/streams)
    * [Developer Guide](/documentation/streams/developer-guide/)
  
+
