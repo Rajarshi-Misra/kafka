@@ -1483,6 +1483,60 @@ Serde for the inner class of a windowed record. Must implement the `Serde` inter
 >             dlqTopic = .. // get the topic name from the configs map
 >         }
 >     }
+>
+
+
+>**Note: The example above demonstrates manual production to a DLQ topic. The following example shows the recommended approach using the built-in DLQ support.**
+> A custom processing exception handler can decide whether to continue or fail processing when user logic throws an exception. If DLQ behavior is required, return DLQ records from the handler response.
+>
+> **Custom Exception Handler Implementation**
+>
+> The following example forwards failed records to a configured DLQ topic:
+>
+> ```java
+> public class DlqProcessingExceptionHandler implements ProcessingExceptionHandler {
+>
+>     private String deadLetterQueueTopic;
+>
+>     @Override
+>     public Response handleError(final ErrorHandlerContext context,
+>                                 final Record<?, ?> record,
+>                                 final Exception exception) {
+>
+>         return Response.resume(
+>             ExceptionHandlerUtils.maybeBuildDeadLetterQueueRecords(
+>                 deadLetterQueueTopic,
+>                 context.sourceRawKey(),
+>                 context.sourceRawValue(),
+>                 context,
+>                 exception
+>             )
+>         );
+>     }
+>
+>     @Override
+>     public void configure(final Map<String, ?> configs) {
+>         deadLetterQueueTopic = (String) configs.get(
+>             StreamsConfig.ERRORS_DEAD_LETTER_QUEUE_TOPIC_NAME_CONFIG
+>         );
+>     }
+> }
+> ```
+> To enable the custom exception handler and configure the DLQ topic:
+>
+> ```java
+> Properties props = new Properties();
+>
+> props.put(
+>     StreamsConfig.PROCESSING_EXCEPTION_HANDLER_CLASS_CONFIG,
+>     DlqProcessingExceptionHandler.class
+> );
+>
+> props.put(
+>     StreamsConfig.ERRORS_DEAD_LETTER_QUEUE_TOPIC_NAME_CONFIG,
+>     "dlq-topic"
+> );
+> ```
 
 ### processing.guarantee
 
